@@ -210,30 +210,40 @@ function placeSide(
   });
 
   // 第二轮:背景水印层 = 超出前景上限的城市 + 前景没放下的城市。
-  // 允许压在前景下面,但按「重叠面积」挑最轻的位置:
-  // 压前景比水印互压更伤可读性,面积加倍计;面积相同再比谁离邻居更远,
-  // 这样水印会优先滑进前景之间的缝隙,而不是叠在前景正下方
+  // 水印词彼此都是同一层淡色,互压会糊成一团,所以优先级为:
+  //   1. 水印互压面积最小(首要 —— 摊开水印层本身);
+  //   2. 压前景的面积最小(垫在前景下是设计稿允许的效果,但能少压就少压);
+  //   3. 面积同级时,选离其他水印净空最大的位置(继续往开阔处摊)。
+  const AREA_EPS = 1e-4; // 面积同级判定(rem²),连续采样几乎不会精确相等
   const background: CloudLabel[] = [];
   const bgBoxes: Box[] = [];
 
   [...deferred, ...wmList.map((text) => ({ text, ...measure(text) }))].forEach(
     ({ text, hw, hh, halfDiag }) => {
-      let best: { x: number; y: number; area: number; clearance: number } | null = null;
+      let best: {
+        x: number;
+        y: number;
+        bgArea: number;
+        fgArea: number;
+        clearance: number;
+      } | null = null;
 
       for (let attempt = 0; attempt < opt.attempts; attempt++) {
         const p = sample(hw, halfDiag);
         if (!p) continue;
-        const area =
-          overlapArea(p.x, p.y, hw, hh, placed) * 2 + overlapArea(p.x, p.y, hw, hh, bgBoxes);
-        const clearance = Math.min(
-          minClearance(p.x, p.y, hw, hh, placed),
-          minClearance(p.x, p.y, hw, hh, bgBoxes),
-          SPREAD_CAP,
-        );
-        if (!best || area < best.area || (area === best.area && clearance > best.clearance)) {
-          best = { x: p.x, y: p.y, area, clearance };
-        }
-        if (best.area === 0 && best.clearance >= SPREAD_CAP) break;
+        const bgArea = overlapArea(p.x, p.y, hw, hh, bgBoxes);
+        const fgArea = overlapArea(p.x, p.y, hw, hh, placed);
+        // 净空只看其他水印:离前景近不要紧(可以垫底),水印之间才需要摊开
+        const clearance = Math.min(minClearance(p.x, p.y, hw, hh, bgBoxes), SPREAD_CAP);
+
+        const better =
+          !best ||
+          bgArea < best.bgArea - AREA_EPS ||
+          (Math.abs(bgArea - best.bgArea) <= AREA_EPS &&
+            (fgArea < best.fgArea - AREA_EPS ||
+              (Math.abs(fgArea - best.fgArea) <= AREA_EPS && clearance > best.clearance)));
+        if (better) best = { x: p.x, y: p.y, bgArea, fgArea, clearance };
+        if (best!.bgArea === 0 && best!.fgArea === 0 && best!.clearance >= SPREAD_CAP) break;
       }
 
       if (!best) return; // 区域太小连候选点都没有(极端情况),跳过
