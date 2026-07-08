@@ -254,6 +254,82 @@ function placeSide(
     },
   );
 
+  // 第三轮:匀布松弛。贪心逐个放置「先到先得」,难免疏密不均——
+  // 有的地方挤成一团,有的地方留着空档。把标签当互斥小盒子迭代
+  // 「推开-拉回」:同层(亮-亮、水印-水印)往 RELAX_GAP 目标间距推;
+  // 跨层只加弱斥力(RELAX_GAP_CROSS)——垫底是设计允许的,但有余地时
+  // 让水印滑离亮色词,且亮色少动、水印多动,保住前景稳定;
+  // 每轮末尾投影回几何约束(自己圆内、透镜外、padX 留白)。
+  const RELAX_GAP = 0.1; // 期望盒间距:0.24 字高 + 0.1 ≈ CSS 行高 145% 的实际渲染行距
+  const RELAX_GAP_CROSS = 0.04; // 跨层(水印-亮色)的弱目标间距
+  const RELAX_ROUNDS = 40;
+
+  const entries = [
+    ...foreground.map((label, i) => ({ label, box: placed[i], fg: true })),
+    ...background.map((label, i) => ({ label, box: bgBoxes[i], fg: false })),
+  ];
+
+  const project = (b: Box) => {
+    const halfDiag = Math.hypot(b.hw, b.hh);
+    if (opt.avoidOther) {
+      const dx = b.x - otherCx;
+      const dy = b.y - geo.cy;
+      const d = Math.hypot(dx, dy) || 1e-6;
+      const min = R + opt.gap + halfDiag;
+      if (d < min) {
+        b.x = otherCx + (dx / d) * min;
+        b.y = geo.cy + (dy / d) * min;
+      }
+    }
+    const dx = b.x - ownCx;
+    const dy = b.y - geo.cy;
+    const d = Math.hypot(dx, dy) || 1e-6;
+    const max = R - opt.edgeMargin - halfDiag;
+    if (d > max) {
+      b.x = ownCx + (dx / d) * max;
+      b.y = geo.cy + (dy / d) * max;
+    }
+    b.x = Math.min(Math.max(b.x, opt.padX + b.hw), geo.width - opt.padX - b.hw);
+  };
+
+  for (let round = 0; round < RELAX_ROUNDS; round++) {
+    let moved = false;
+    for (let i = 0; i < entries.length; i++) {
+      for (let j = i + 1; j < entries.length; j++) {
+        const sameLayer = entries[i].fg === entries[j].fg;
+        const target = sameLayer ? RELAX_GAP : RELAX_GAP_CROSS;
+        const a = entries[i].box;
+        const c = entries[j].box;
+        const dx = c.x - a.x;
+        const dy = c.y - a.y;
+        const sepX = Math.abs(dx) - (a.hw + c.hw);
+        const sepY = Math.abs(dy) - (a.hh + c.hh);
+        const sep = Math.max(sepX, sepY);
+        if (sep >= target) continue;
+        const push = (target - sep) * 0.5; // 双方合计推开差值,阻尼 0.5 防震荡
+        // 跨层时亮色只动 15%,水印动 85%,保住前景稳定
+        const wa = sameLayer ? 0.5 : entries[i].fg ? 0.15 : 0.85;
+        const wc = sameLayer ? 0.5 : entries[j].fg ? 0.15 : 0.85;
+        if (sepX >= sepY) {
+          const s = dx >= 0 ? 1 : -1;
+          a.x -= s * push * wa;
+          c.x += s * push * wc;
+        } else {
+          const s = dy >= 0 ? 1 : -1;
+          a.y -= s * push * wa;
+          c.y += s * push * wc;
+        }
+        moved = true;
+      }
+    }
+    entries.forEach((e) => project(e.box));
+    if (!moved) break; // 全部达到目标间距,提前收敛
+  }
+  entries.forEach(({ label, box }) => {
+    label.x = box.x;
+    label.y = box.y;
+  });
+
   // 背景层排在前,DOM 顺序即绘制顺序,前景清晰文字压在水印之上
   return [...background, ...foreground];
 }
