@@ -61,13 +61,15 @@ export const FOOTPRINT_GEO_APART: VennGeometry = {
 // 透镜(交集)中心 = 容器横向正中,纵向与两圆同高
 export const lensCenter = (geo: VennGeometry) => ({ x: geo.width / 2, y: geo.cy });
 
-// 字号统一;放得下的城市 opacity 1 且互不重叠,放不下的降为淡色水印层垫底
+// 字号统一;前 10 个城市 opacity 1 且互不重叠,之后的降为淡色水印层垫底,
+// 每侧最多展示 20 个(≤10 个时全部亮色前景)
 const DEFAULT_SIZE = 0.24;
 
 export interface VennCloudOptions {
   geo?: VennGeometry;
   size?: number; // 统一字号 rem
   max?: number; // 每侧最多展示数量,超出丢弃(应对城市过多)
+  maxForeground?: number; // 每侧前景(亮色)上限,超出的直接进水印层
   gap?: number; // 判定「重叠」的间距阈值 rem(框间小于它即算重叠)
   edgeMargin?: number; // 距圆边的安全内缩 rem
   padX?: number; // 左右两端为「计数」预留的横向空白 rem
@@ -175,6 +177,10 @@ function placeSide(
   // 取值别太大 —— 会把标签全推向圆边;别太小 —— 密集时起不到摊开作用
   const SPREAD_CAP = 0.4;
 
+  // 前 maxForeground 个进前景,之后的直接进水印层(≤上限则全部前景)
+  const fgList = list.slice(0, opt.maxForeground);
+  const wmList = list.slice(opt.maxForeground);
+
   // 第一轮:只接受「完全无重叠」的位置,铺出清晰可读的前景层。
   // 不再「随机命中即用」,而是在候选里挑离已放标签最远的一个:
   // 标签少时摊得开,标签多时逼着后来者钻进空隙,前景能放下的城市更多。
@@ -182,7 +188,7 @@ function placeSide(
   const foreground: CloudLabel[] = [];
   const deferred: { text: string; hw: number; hh: number; halfDiag: number }[] = [];
 
-  list.forEach((text) => {
+  fgList.forEach((text) => {
     const { hw, hh, halfDiag } = measure(text);
     let best: { x: number; y: number; clearance: number } | null = null;
 
@@ -203,36 +209,39 @@ function placeSide(
     }
   });
 
-  // 第二轮:背景水印层。允许压在前景下面,但按「重叠面积」挑最轻的位置:
+  // 第二轮:背景水印层 = 超出前景上限的城市 + 前景没放下的城市。
+  // 允许压在前景下面,但按「重叠面积」挑最轻的位置:
   // 压前景比水印互压更伤可读性,面积加倍计;面积相同再比谁离邻居更远,
   // 这样水印会优先滑进前景之间的缝隙,而不是叠在前景正下方
   const background: CloudLabel[] = [];
   const bgBoxes: Box[] = [];
 
-  deferred.forEach(({ text, hw, hh, halfDiag }) => {
-    let best: { x: number; y: number; area: number; clearance: number } | null = null;
+  [...deferred, ...wmList.map((text) => ({ text, ...measure(text) }))].forEach(
+    ({ text, hw, hh, halfDiag }) => {
+      let best: { x: number; y: number; area: number; clearance: number } | null = null;
 
-    for (let attempt = 0; attempt < opt.attempts; attempt++) {
-      const p = sample(hw, halfDiag);
-      if (!p) continue;
-      const area =
-        overlapArea(p.x, p.y, hw, hh, placed) * 2 + overlapArea(p.x, p.y, hw, hh, bgBoxes);
-      const clearance = Math.min(
-        minClearance(p.x, p.y, hw, hh, placed),
-        minClearance(p.x, p.y, hw, hh, bgBoxes),
-        SPREAD_CAP,
-      );
-      if (!best || area < best.area || (area === best.area && clearance > best.clearance)) {
-        best = { x: p.x, y: p.y, area, clearance };
+      for (let attempt = 0; attempt < opt.attempts; attempt++) {
+        const p = sample(hw, halfDiag);
+        if (!p) continue;
+        const area =
+          overlapArea(p.x, p.y, hw, hh, placed) * 2 + overlapArea(p.x, p.y, hw, hh, bgBoxes);
+        const clearance = Math.min(
+          minClearance(p.x, p.y, hw, hh, placed),
+          minClearance(p.x, p.y, hw, hh, bgBoxes),
+          SPREAD_CAP,
+        );
+        if (!best || area < best.area || (area === best.area && clearance > best.clearance)) {
+          best = { x: p.x, y: p.y, area, clearance };
+        }
+        if (best.area === 0 && best.clearance >= SPREAD_CAP) break;
       }
-      if (best.area === 0 && best.clearance >= SPREAD_CAP) break;
-    }
 
-    if (!best) return; // 区域太小连候选点都没有(极端情况),跳过
+      if (!best) return; // 区域太小连候选点都没有(极端情况),跳过
 
-    bgBoxes.push({ x: best.x, y: best.y, hw, hh });
-    background.push({ text, x: best.x, y: best.y, size, opacity: opt.dimOpacity });
-  });
+      bgBoxes.push({ x: best.x, y: best.y, hw, hh });
+      background.push({ text, x: best.x, y: best.y, size, opacity: opt.dimOpacity });
+    },
+  );
 
   // 背景层排在前,DOM 顺序即绘制顺序,前景清晰文字压在水印之上
   return [...background, ...foreground];
@@ -246,7 +255,8 @@ export function buildVennCloud(
   const opt: ResolvedOptions = {
     geo: options.geo ?? FOOTPRINT_GEO,
     size: options.size ?? DEFAULT_SIZE,
-    max: options.max ?? 18,
+    max: options.max ?? 20,
+    maxForeground: options.maxForeground ?? 10,
     gap: options.gap ?? 0.06,
     edgeMargin: options.edgeMargin ?? 0.06,
     padX: options.padX ?? 0.95,
