@@ -149,60 +149,83 @@ function placeSide(
     return { x, y };
   };
 
-  // 统计候选点与一组已放置框的重叠个数(框间距小于 gap 即算重叠)
-  const countOverlap = (x: number, y: number, hw: number, hh: number, boxes: Box[]) => {
-    let overlap = 0;
-    for (const b of boxes) {
-      if (Math.abs(x - b.x) < hw + b.hw + opt.gap && Math.abs(y - b.y) < hh + b.hh + opt.gap) {
-        overlap++;
-      }
-    }
-    return overlap;
+  // 候选框与已放置框的净空:两轴各自的空隙取较大者。
+  // >= gap 即互不重叠(与原「框间距小于 gap 算重叠」判定等价),越大离得越开
+  const clearanceTo = (x: number, y: number, hw: number, hh: number, b: Box) =>
+    Math.max(Math.abs(x - b.x) - (hw + b.hw), Math.abs(y - b.y) - (hh + b.hh));
+
+  const minClearance = (x: number, y: number, hw: number, hh: number, boxes: Box[]) => {
+    let min = Infinity;
+    for (const b of boxes) min = Math.min(min, clearanceTo(x, y, hw, hh, b));
+    return min;
   };
 
-  // 第一轮:只接受「完全无重叠」的位置,铺出清晰可读的前景层;
+  // 候选框与一组已放置框的重叠总面积(用于水印层,比「重叠个数」更能区分压多压少)
+  const overlapArea = (x: number, y: number, hw: number, hh: number, boxes: Box[]) => {
+    let area = 0;
+    for (const b of boxes) {
+      const ox = Math.min(x + hw, b.x + b.hw) - Math.max(x - hw, b.x - b.hw);
+      const oy = Math.min(y + hh, b.y + b.hh) - Math.max(y - hh, b.y - b.hh);
+      if (ox > 0 && oy > 0) area += ox * oy;
+    }
+    return area;
+  };
+
+  // 净空超过该值即视为「够开阔」:再远不加分,并允许提前收工。
+  // 取值别太大 —— 会把标签全推向圆边;别太小 —— 密集时起不到摊开作用
+  const SPREAD_CAP = 0.4;
+
+  // 第一轮:只接受「完全无重叠」的位置,铺出清晰可读的前景层。
+  // 不再「随机命中即用」,而是在候选里挑离已放标签最远的一个:
+  // 标签少时摊得开,标签多时逼着后来者钻进空隙,前景能放下的城市更多。
   // 放不下的城市转入第二轮,降为淡色水印垫在底下(对齐设计稿的双层效果)
   const foreground: CloudLabel[] = [];
   const deferred: { text: string; hw: number; hh: number; halfDiag: number }[] = [];
 
   list.forEach((text) => {
     const { hw, hh, halfDiag } = measure(text);
-    let found: { x: number; y: number } | null = null;
+    let best: { x: number; y: number; clearance: number } | null = null;
 
     for (let attempt = 0; attempt < opt.attempts; attempt++) {
       const p = sample(hw, halfDiag);
       if (!p) continue;
-      if (countOverlap(p.x, p.y, hw, hh, placed) === 0) {
-        found = p;
-        break;
-      }
+      const clearance = Math.min(minClearance(p.x, p.y, hw, hh, placed), SPREAD_CAP);
+      if (clearance < opt.gap) continue; // 与已放标签重叠
+      if (!best || clearance > best.clearance) best = { ...p, clearance };
+      if (best.clearance >= SPREAD_CAP) break; // 已够开阔,保留随机散点的自然感
     }
 
-    if (found) {
-      placed.push({ x: found.x, y: found.y, hw, hh });
-      foreground.push({ text, x: found.x, y: found.y, size, opacity: 1 });
+    if (best) {
+      placed.push({ x: best.x, y: best.y, hw, hh });
+      foreground.push({ text, x: best.x, y: best.y, size, opacity: 1 });
     } else {
       deferred.push({ text, hw, hh, halfDiag });
     }
   });
 
-  // 第二轮:背景水印层。允许压在前景下面,但尽量选重叠最少的位置摊开
+  // 第二轮:背景水印层。允许压在前景下面,但按「重叠面积」挑最轻的位置:
+  // 压前景比水印互压更伤可读性,面积加倍计;面积相同再比谁离邻居更远,
+  // 这样水印会优先滑进前景之间的缝隙,而不是叠在前景正下方
   const background: CloudLabel[] = [];
   const bgBoxes: Box[] = [];
 
   deferred.forEach(({ text, hw, hh, halfDiag }) => {
-    let best: { x: number; y: number; overlap: number } | null = null;
+    let best: { x: number; y: number; area: number; clearance: number } | null = null;
 
     for (let attempt = 0; attempt < opt.attempts; attempt++) {
       const p = sample(hw, halfDiag);
       if (!p) continue;
-      const overlap =
-        countOverlap(p.x, p.y, hw, hh, placed) + countOverlap(p.x, p.y, hw, hh, bgBoxes);
-      if (overlap === 0) {
-        best = { x: p.x, y: p.y, overlap: 0 };
-        break;
+      const area =
+        overlapArea(p.x, p.y, hw, hh, placed) * 2 + overlapArea(p.x, p.y, hw, hh, bgBoxes);
+      const clearance = Math.min(
+        minClearance(p.x, p.y, hw, hh, placed),
+        minClearance(p.x, p.y, hw, hh, bgBoxes),
+        SPREAD_CAP,
+      );
+      if (!best || area < best.area || (area === best.area && clearance > best.clearance)) {
+        best = { x: p.x, y: p.y, area, clearance };
       }
-      if (!best || overlap < best.overlap) best = { x: p.x, y: p.y, overlap };
+      if (best.area === 0 && best.clearance >= SPREAD_CAP) break;
     }
 
     if (!best) return; // 区域太小连候选点都没有(极端情况),跳过
@@ -229,7 +252,7 @@ export function buildVennCloud(
     padX: options.padX ?? 0.95,
     lineHeight: options.lineHeight ?? 1,
     letterSpacing: options.letterSpacing ?? 0,
-    attempts: options.attempts ?? 400,
+    attempts: options.attempts ?? 600,
     dimOpacity: options.dimOpacity ?? 0.22,
     avoidOther: options.avoidOther ?? true,
   };
